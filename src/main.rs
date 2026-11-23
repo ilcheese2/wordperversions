@@ -58,7 +58,7 @@ fn kwd(s: &'_ str) -> impl Parser<'_, &'_ str, &'_ str, extra::Err<Simple<'_, ch
 
 
 fn ident<'a>() -> impl Parser<'a, &'a str, String, extra::Err<Simple<'a, char>>> + Clone {
-    text::ident().filter(|x| *x != "def" && *x != "fun" && *x != "theorem" && *x != "Type").padded().map(|s: &str| s.to_string())
+    text::ident().filter(|x| *x != "def" && *x != "fun" && *x != "theorem" && *x != "Type" && *x != "inductive").padded().map(|s: &str| s.to_string())
 }
 
 fn unpack(is_pi: bool, binders: Vec<(Vec<String>, Term)>, body: Term) -> Term { // i hate this is pattern
@@ -127,7 +127,7 @@ fn gen_indices(term: Term, indices: &mut Vec<String>) -> Term { // this is so ha
     }
 }
 
-fn parser<'src>() -> impl Parser<'src, &'src str, Vec<ConstantInfo>, extra::Err<Simple<'src, char>>> {
+fn parser<'src>() -> impl Parser<'src, &'src str, Vec<(String, ConstantInfo)>, extra::Err<Simple<'src, char>>> {
     choice((choice((kwd("def").to(false), kwd("theorem").to(true)))
         .then(ident())
         .then_ignore(sym(":"))
@@ -136,9 +136,9 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Vec<ConstantInfo>, extra::Err<
         .then(term())
         .map(|(((is_theorem, name), ty), value)| {
             if is_theorem {
-                ConstantInfo::Theorem(gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new()))
+                (name, ConstantInfo::Theorem(gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new())))
             } else {
-                ConstantInfo::Definition(gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new()))
+                (name, ConstantInfo::Definition(gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new())))
             }
         }), kwd("inductive")
         .ignore_then(ident())
@@ -147,7 +147,7 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Vec<ConstantInfo>, extra::Err<
         .then_ignore(sym(":="))
         .then(sym("|").ignore_then(ident().then_ignore(sym(":")).then(term())).repeated().collect::<Vec<_>>())
         .map(|((name, ty), branches)| {
-            ConstantInfo::Inductive(name, ty, branches.into_iter().map(|(name, term)| (name, gen_indices(term, &mut Vec::new()))).collect())
+            (name, ConstantInfo::Inductive(ty, branches.into_iter().map(|(name, term)| (name, gen_indices(term, &mut Vec::new()))).collect()))
         }))).repeated().collect().then_ignore(end())
 }
 
@@ -176,22 +176,39 @@ fn real_substitute(term: Term, index: usize, replacement: Term) -> Term {
 }
 
 fn substitute(term: Term, replacement: Term) -> Term {
-    shift(real_substitute(shift(term, 0, 0), 0, replacement), -1, 0)
+    shift(real_substitute(term, 0, shift(replacement, 1, 0)), -1, 0)
 }
 
 fn reduce(env: &Environment, term: Term) -> Term {
     match term {
-        Term::Call(f, a) => { // beta
-            let rf = reduce(env, *f);
-            if let Term::Lambda(_, _, body) = rf {
-                reduce(env, substitute(*body, *a))
-            } else {
-                Term::Call(Box::new(rf), a)
+        Term::Call(_, _) => {
+            let (f, args) = unroll_call(term);
+            let rf = reduce(env, f);
+
+            if let Term::Lambda(_, _, body) = rf { // beta
+                let mut iter = args.into_iter();
+                return reduce(env, apply(substitute(*body, iter.next().unwrap()), iter));
+            } else if let Term::Global(ref name) = rf { // iota
+                if let Some(ConstantInfo::Recursor(_, num_minors, rules)) = env.constants.get(name) {
+                    let i = 1 + num_minors;
+                    if args.len() > i {
+                        let (f, bargs) = unroll_call(reduce(env, args[i].clone()));
+                        if let Term::Global(ref name) = f {
+                            if let Some(rule) = rules.iter().find(|r| {
+                                &r.0 == name && r.1 == bargs.len()
+                            }) {
+                                let mut new_args = args[..i].to_vec();
+                                new_args.extend(bargs);
+                                new_args.extend(args[i + 1..].iter().cloned());
+                                return reduce(env, apply(rule.2.clone(), new_args));
+                            }
+                        }
+                    }
+                }
             }
+            apply(rf, args)
         },
-        Term::Global(ref name) => { // delta
-            env.constants.get(name).map(|info| info.ty().clone()).unwrap_or(Term::Global(name.clone()))
-        }
+        Term::Global(ref name) if let Some(ConstantInfo::Definition(_, value)) = env.constants.get(name) => reduce(env, value.clone()), // delta // i had to update rust for this
         _ => term
     }
 }
@@ -211,27 +228,32 @@ fn equal(env: &Environment, a: &Term, b: &Term) -> bool { // alpha equivalence
     }
 }
 
-fn add_declaration(env: &mut Environment, declaration: Declaration) -> Result<(), TypeError> {
+fn add_declaration(env: &mut Environment, name: String, constant: ConstantInfo) -> Result<(), TypeError> {
     let mut context = Vec::new();
-    match declaration {
-        Declaration::Definition(name, ty, value) => {
+    match constant {
+        ConstantInfo::Definition(ty, value) => {
             get_universe(env, &mut context, &ty)?;
             check(env, &mut context, &value, &ty)?;
-            env.definitions.insert(name.clone(), Declaration::Definition(name, reduce(env, ty), reduce(env, value)));
+            env.constants.insert(name.clone(), ConstantInfo::Definition(reduce(env, ty), reduce(env, value)));
         },
-        Declaration::Inductive(name, ty, branches) => {
+        ConstantInfo::Inductive(ty, branches) => {
             get_universe(env, &mut context, &ty)?;
-            env.definitions.insert(name.clone(), Term::Global(name.clone()));
-            for (branch_name, branch_ty) in branches.iter() {
-                check(env, &mut context, branch_ty, &Term::Global(name.clone()))?;
-
+            env.constants.insert(name.clone(), ConstantInfo::Inductive(ty.clone(), branches.clone()));
+            for (bname, ty) in &branches { // i love shadowing
+                get_universe(env, &mut context, ty)?;
+                env.constants.insert(bname.clone(), ConstantInfo::Constructor(ty.clone(), name.clone(), unroll_pi(ty.clone()).len()));
             }
-            env.definitions.insert(name.clone(), Declaration::Inductive(name, reduce(env, ty), branches.into_iter().map(|(n, t)| (n, reduce(env, t))).collect()));
-        },
-        _ => {
 
-        }
-    }Ok(())
+            env.constants.insert(name.clone() + "_rec", gen_recursor(&name, &branches));
+        },
+        ConstantInfo::Theorem(ty, value) => {
+            get_universe(env, &mut context, &ty)?;
+            check(env, &mut context, &value, &ty)?;
+            env.constants.insert(name.clone(), ConstantInfo::Theorem(reduce(env, ty), reduce(env, value)));
+        },
+        _ => { unreachable!() } // #goodcode
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -255,7 +277,7 @@ impl Display for TypeError {
 impl std::error::Error for TypeError {}
 
 fn get_universe(env: &Environment, context: &mut Vec<Term>, term: &Term) -> Result<usize, TypeError> {
-    match infer(env, context, term)? {
+    match reduce(env, infer(env, context, term)?) {
         Term::Universe(i) => Ok(i),
         _ => Err(TypeError::DidntReduce),
     }
@@ -294,8 +316,8 @@ fn infer(env: &Environment, context: &mut Vec<Term>, term: &Term) -> Result<Term
         Term::Global(name) => env.constants.get(name).map(|info| info.ty().clone()).ok_or(TypeError::NoGlobal),
         Term::Call(f, a) => {
             let f_ty = reduce(env, infer(env, context, f)?);
-            if let Term::Pi(_, param_ty, ret_ty) = f_ty {
-                check(env, context, a, &param_ty)?;
+            if let Term::Pi(_, arg_ty, ret_ty) = f_ty {
+                check(env, context, a, &arg_ty)?;
                 Ok(substitute(*ret_ty, *a.clone()))
             } else {
                 Err(TypeError::DidntReduce)
@@ -320,13 +342,23 @@ fn infer(env: &Environment, context: &mut Vec<Term>, term: &Term) -> Result<Term
 }
 
 
-fn unroll_pi(mut ty: Term) -> Vec<(String, Term)> {
+fn unroll_pi(mut term: Term) -> Vec<(String, Term)> {
     let mut fields = Vec::new();
-    while let Term::Pi(name, field_ty, body) = ty {
+    while let Term::Pi(name, field_ty, body) = term {
         fields.push((name, *field_ty));
-        ty = *body;
+        term = *body;
     }
-    (fields)
+    fields
+}
+
+fn unroll_call(mut term: Term) -> (Term, Vec<(Term)>) {
+    let mut args = Vec::new();
+    while let Term::Call(f, a) = term {
+        args.push(*a);
+        term = *f;
+    }
+    args.reverse();
+    (term, args)
 }
 
 fn compile_rule(rec_name: &str, num_minors: usize, i: usize, recursive: Vec<bool>) -> Term {
@@ -335,7 +367,6 @@ fn compile_rule(rec_name: &str, num_minors: usize, i: usize, recursive: Vec<bool
     for (j, &is_rec) in recursive.iter().enumerate() {
         let field = Term::Var(recursive.len() - 1 - j);
         body = Term::Call(Box::new(body), Box::new(field.clone()));
-
         if is_rec {
             let mut args = Vec::new();
             args.push(Term::Var(recursive.len() + num_minors));
@@ -343,8 +374,7 @@ fn compile_rule(rec_name: &str, num_minors: usize, i: usize, recursive: Vec<bool
                 args.push(Term::Var(recursive.len() + (num_minors - 1 - i)));
             }
             args.push(field);
-            args.push(Term::Global(rec_name.to_string()));
-            body = apply(body, args);
+            body = call(body, apply(Term::Global(rec_name.to_string()), args));
         }
     }
 
@@ -361,12 +391,11 @@ fn call(f: Term, a: Term) -> Term { Term::Call(Box::new(f), Box::new(a)) }
 fn apply(f: Term, args: impl IntoIterator<Item = Term>) -> Term { args.into_iter().fold(f, call)}
 
 fn gen_recursor(ind: &str, branches: &Vec<(String, Term)>) -> ConstantInfo {
-
-    let mut ty = Term::Pi("x".to_string(), Box::new(Term::Global(ind.to_string())), Box::new(Term::Call(Box::new(Term::Var(branches.len()+1)), Box::new(Term::Var(1)))));
+    let mut ty = Term::Pi("x".to_string(), Box::new(Term::Global(ind.to_string())), Box::new(Term::Call(Box::new(Term::Var(branches.len()+1)), Box::new(Term::Var(0)))));
     let all_fields: Vec<Vec<(String, Term)>> = branches.iter().map(|(_, ty)| unroll_pi(ty.clone())).collect();
 
     let mut rules = Vec::with_capacity(branches.len());
-    for (i, ((name, _), fields)) in branches.iter().zip(&all_fields).enumerate() { // minor premises this naming scheme is very confusing
+    for (i, ((name, _), fields)) in branches.iter().zip(&all_fields).enumerate().rev() { // minor premises this naming scheme is very confusing
         let recursive: Vec<bool> = fields.iter().map(|(_, ty)| match ty {
             Term::Global(name) => name == ind,
             _ => false,
@@ -390,7 +419,7 @@ fn gen_recursor(ind: &str, branches: &Vec<(String, Term)>) -> ConstantInfo {
         }
 
         let fields: Vec<Term> = binder_offsets.iter().map(|&i| Term::Var(binders.len() - 1 - i)).collect();
-        let call = apply(Term::Global(name.clone()), fields);
+        let call = apply(Term::Global(name.clone()), fields.clone());
 
         let mut minor_ty = Term::Call(Box::new(Term::Var(j)), Box::new(call));
         for (name, ty) in binders.into_iter().rev() {
@@ -399,7 +428,7 @@ fn gen_recursor(ind: &str, branches: &Vec<(String, Term)>) -> ConstantInfo {
 
         ty = Term::Pi("".to_string(), Box::new(minor_ty), Box::new(ty));
 
-        rules.push(RecursorRule(name.clone(), i, compile_rule(&*(ind.to_owned() + ".rec"), branches.len(), i, recursive)));
+        rules.push(RecursorRule(name.clone(), fields.len(), compile_rule(&*(ind.to_owned() + "_rec"), branches.len(), i, recursive)));
     }
 
     rules.reverse();
@@ -418,8 +447,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     s = s.replace("→", "->");
     let parser = parser();
     let declarations = parser.parse(s.as_str()).into_result().unwrap(); // fuck you
-    for declaration in declarations {
-        add_declaration(&mut Environment { definitions: HashMap::new() }, declaration)?;
+    let mut env = Environment { constants: HashMap::new() };
+    for (name, declaration) in declarations {
+        add_declaration(&mut env, name, declaration)?;
     }
     Ok(())
 }
