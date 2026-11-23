@@ -1,12 +1,3 @@
-def compose :
-    (α : Type) → (β : Type) → (γ : Type) →
-    (g : (b : β) → γ) →
-    (f : (a : α) → β) →
-    (x : α) → γ :=
-  fun (α : Type) =>
-  fun (β : Type) =>
-  fun (γ : Type) =>
-  fun (g : (b : β) → γ) =>
-  fun (f : (a : α) → β) =>
-  fun (x : α) =>
-  g (f x)
+inductive Nat : Type :=
+    | zero : Nat
+    | succ : Nat -> Nat

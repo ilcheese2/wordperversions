@@ -24,10 +24,28 @@ enum Term {
     Let(Box<Term>, Box<Term>, Box<Term>),
 }
 
+#[derive(Clone, Debug)]
+struct RecursorRule(String, usize, Term);
+
 #[derive(Debug, Clone)]
-enum Declaration {
-    Definition(String, Term, Term),
-    Theorem(String, Term, Term),
+enum ConstantInfo { // lean4
+    Definition(Term, Term),
+    Theorem(Term, Term),
+    Inductive(Term, Vec<(String, Term)>),
+    Constructor(Term, String, usize), // idxed by name
+    Recursor(Term, usize, Vec<RecursorRule>)
+}
+
+impl ConstantInfo {
+    fn ty(&self) -> &Term {
+        match self {
+            ConstantInfo::Definition(ty, _) => ty,
+            ConstantInfo::Theorem(ty, _) => ty,
+            ConstantInfo::Inductive(ty, _) => ty,
+            ConstantInfo::Constructor(ty, _, _) => ty,
+            ConstantInfo::Recursor(ty, _, _) => ty
+        }
+    }
 }
 
 fn sym(s: &'_ str) -> impl Parser<'_, &'_ str, &'_ str, extra::Err<Simple<'_, char>>> + Clone {
@@ -109,8 +127,8 @@ fn gen_indices(term: Term, indices: &mut Vec<String>) -> Term { // this is so ha
     }
 }
 
-fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Declaration>, extra::Err<Simple<'src, char>>> {
-    choice((kwd("def").to(false), kwd("theorem").to(true)))
+fn parser<'src>() -> impl Parser<'src, &'src str, Vec<ConstantInfo>, extra::Err<Simple<'src, char>>> {
+    choice((choice((kwd("def").to(false), kwd("theorem").to(true)))
         .then(ident())
         .then_ignore(sym(":"))
         .then(term())
@@ -118,15 +136,23 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Vec<Declaration>, extra::Err<S
         .then(term())
         .map(|(((is_theorem, name), ty), value)| {
             if is_theorem {
-                Declaration::Theorem(name, gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new()))
+                ConstantInfo::Theorem(gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new()))
             } else {
-                Declaration::Definition(name, gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new()))
+                ConstantInfo::Definition(gen_indices(ty, &mut Vec::new()), gen_indices(value, &mut Vec::new()))
             }
-        }).repeated().collect().then_ignore(end())
+        }), kwd("inductive")
+        .ignore_then(ident())
+        .then_ignore(sym(":"))
+        .then(term())
+        .then_ignore(sym(":="))
+        .then(sym("|").ignore_then(ident().then_ignore(sym(":")).then(term())).repeated().collect::<Vec<_>>())
+        .map(|((name, ty), branches)| {
+            ConstantInfo::Inductive(name, ty, branches.into_iter().map(|(name, term)| (name, gen_indices(term, &mut Vec::new()))).collect())
+        }))).repeated().collect().then_ignore(end())
 }
 
 struct Environment {
-    definitions: HashMap<String, Declaration>,
+    constants: HashMap<String, ConstantInfo>,
 }
 
 fn shift(term: Term, amount: isize, depth: usize) -> Term {
@@ -157,18 +183,14 @@ fn reduce(env: &Environment, term: Term) -> Term {
     match term {
         Term::Call(f, a) => { // beta
             let rf = reduce(env, *f);
-            if let Term::Lambda(name, ty, body) = rf {
+            if let Term::Lambda(_, _, body) = rf {
                 reduce(env, substitute(*body, *a))
             } else {
                 Term::Call(Box::new(rf), a)
             }
         },
         Term::Global(ref name) => { // delta
-            if let Some(Declaration::Definition(_, _, val)) = env.definitions.get(name) {
-                reduce(env, val.clone())
-            } else {
-                term
-            }
+            env.constants.get(name).map(|info| info.ty().clone()).unwrap_or(Term::Global(name.clone()))
         }
         _ => term
     }
@@ -183,8 +205,8 @@ fn equal(env: &Environment, a: &Term, b: &Term) -> bool { // alpha equivalence
         (Term::Global(a), Term::Global(b)) => a == b,
         (Term::Literal(a), Term::Literal(b)) => a == b,
         (Term::Call(f1, a1), Term::Call(f2, a2)) => equal(env, &f1, &f2) && equal(env, &a1, &a2),
-        (Term::Pi(n1, t1, b1), Term::Pi(n2, t2, b2)) => equal(env, &t1, &t2) && equal(env, &b1, &b2),
-        (Term::Lambda(n1, t1, b1), Term::Lambda(n2, t2, b2)) => equal(env, &t1, &t2) && equal(env, &b1, &b2),
+        (Term::Pi(_, t1, b1), Term::Pi(_, t2, b2)) => equal(env, &t1, &t2) && equal(env, &b1, &b2),
+        (Term::Lambda(_, t1, b1), Term::Lambda(_, t2, b2)) => equal(env, &t1, &t2) && equal(env, &b1, &b2),
         _ => false,
     }
 }
@@ -196,7 +218,16 @@ fn add_declaration(env: &mut Environment, declaration: Declaration) -> Result<()
             get_universe(env, &mut context, &ty)?;
             check(env, &mut context, &value, &ty)?;
             env.definitions.insert(name.clone(), Declaration::Definition(name, reduce(env, ty), reduce(env, value)));
-        }
+        },
+        Declaration::Inductive(name, ty, branches) => {
+            get_universe(env, &mut context, &ty)?;
+            env.definitions.insert(name.clone(), Term::Global(name.clone()));
+            for (branch_name, branch_ty) in branches.iter() {
+                check(env, &mut context, branch_ty, &Term::Global(name.clone()))?;
+
+            }
+            env.definitions.insert(name.clone(), Declaration::Inductive(name, reduce(env, ty), branches.into_iter().map(|(n, t)| (n, reduce(env, t))).collect()));
+        },
         _ => {
 
         }
@@ -260,13 +291,7 @@ fn infer(env: &Environment, context: &mut Vec<Term>, term: &Term) -> Result<Term
             }
         }
         Term::Universe(i) => Ok(Term::Universe(i + 1)),
-        Term::Global(name) => {
-            if let Some(Declaration::Definition(_, ty, _)) = env.definitions.get(name) {
-                Ok(ty.clone())
-            } else {
-                Err(TypeError::NoGlobal)
-            }
-        }
+        Term::Global(name) => env.constants.get(name).map(|info| info.ty().clone()).ok_or(TypeError::NoGlobal),
         Term::Call(f, a) => {
             let f_ty = reduce(env, infer(env, context, f)?);
             if let Term::Pi(_, param_ty, ret_ty) = f_ty {
@@ -294,6 +319,99 @@ fn infer(env: &Environment, context: &mut Vec<Term>, term: &Term) -> Result<Term
     }
 }
 
+
+fn unroll_pi(mut ty: Term) -> Vec<(String, Term)> {
+    let mut fields = Vec::new();
+    while let Term::Pi(name, field_ty, body) = ty {
+        fields.push((name, *field_ty));
+        ty = *body;
+    }
+    (fields)
+}
+
+fn compile_rule(rec_name: &str, num_minors: usize, i: usize, recursive: Vec<bool>) -> Term {
+    let mut body = Term::Var(recursive.len() + (num_minors - 1 - i));;
+
+    for (j, &is_rec) in recursive.iter().enumerate() {
+        let field = Term::Var(recursive.len() - 1 - j);
+        body = Term::Call(Box::new(body), Box::new(field.clone()));
+
+        if is_rec {
+            let mut args = Vec::new();
+            args.push(Term::Var(recursive.len() + num_minors));
+            for i in 0..num_minors {
+                args.push(Term::Var(recursive.len() + (num_minors - 1 - i)));
+            }
+            args.push(field);
+            args.push(Term::Global(rec_name.to_string()));
+            body = apply(body, args);
+        }
+    }
+
+    for _ in (0..recursive.len()).rev() {
+        body = Term::Lambda("".to_string(), Box::new(Term::Universe(0)), Box::new(body));
+    }
+    for _ in (0..num_minors).rev() {
+        body = Term::Lambda("".to_string(), Box::new(Term::Universe(0)), Box::new(body));
+    }
+    Term::Lambda("".to_string(), Box::new(Term::Universe(0)), Box::new(body))
+}
+
+fn call(f: Term, a: Term) -> Term { Term::Call(Box::new(f), Box::new(a)) }
+fn apply(f: Term, args: impl IntoIterator<Item = Term>) -> Term { args.into_iter().fold(f, call)}
+
+fn gen_recursor(ind: &str, branches: &Vec<(String, Term)>) -> ConstantInfo {
+
+    let mut ty = Term::Pi("x".to_string(), Box::new(Term::Global(ind.to_string())), Box::new(Term::Call(Box::new(Term::Var(branches.len()+1)), Box::new(Term::Var(1)))));
+    let all_fields: Vec<Vec<(String, Term)>> = branches.iter().map(|(_, ty)| unroll_pi(ty.clone())).collect();
+
+    let mut rules = Vec::with_capacity(branches.len());
+    for (i, ((name, _), fields)) in branches.iter().zip(&all_fields).enumerate() { // minor premises this naming scheme is very confusing
+        let recursive: Vec<bool> = fields.iter().map(|(_, ty)| match ty {
+            Term::Global(name) => name == ind,
+            _ => false,
+        }).collect();
+        let mut j = i;
+
+        let mut binders = Vec::new();
+        let mut binder_offsets = Vec::new();
+
+        //  motive ctor fields ctor
+        for (i, (name, ty)) in fields.into_iter().enumerate() {
+            binder_offsets.push(binders.len());
+            binders.push((name.clone(), ty.clone()));
+            j += 1;
+
+            if recursive[i] {
+                let ty = Term::Call(Box::new(Term::Var(j)), Box::new(Term::Var(0))); // induction hypothesis, built backwards
+                binders.push(("ih".to_string(), ty));
+                j += 1;
+            }
+        }
+
+        let fields: Vec<Term> = binder_offsets.iter().map(|&i| Term::Var(binders.len() - 1 - i)).collect();
+        let call = apply(Term::Global(name.clone()), fields);
+
+        let mut minor_ty = Term::Call(Box::new(Term::Var(j)), Box::new(call));
+        for (name, ty) in binders.into_iter().rev() {
+            minor_ty = Term::Pi(name.clone(), Box::new(ty.clone()), Box::new(minor_ty));
+        }
+
+        ty = Term::Pi("".to_string(), Box::new(minor_ty), Box::new(ty));
+
+        rules.push(RecursorRule(name.clone(), i, compile_rule(&*(ind.to_owned() + ".rec"), branches.len(), i, recursive)));
+    }
+
+    rules.reverse();
+
+    let motive_ty = Term::Pi(
+        String::new(),
+        Box::new(Term::Global(ind.to_string())),
+        Box::new(Term::Universe(0)),
+    );
+    ty = Term::Pi("".to_string(), Box::new(motive_ty), Box::new(ty));
+    ConstantInfo::Recursor(ty, branches.len(), rules)
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut s = String::new();
     File::open("variable.pv")?.read_to_string(&mut s)?;
