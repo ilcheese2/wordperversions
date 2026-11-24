@@ -1,0 +1,76 @@
+-- https://courses.../.../fa2026/A/Exams/Versions/Exam3_BottomSol.pdf
+
+inductive Z : Type :=
+  | z0 : Z
+
+inductive Z2 : Type :=
+  | mk : Z -> Z -> Z2
+
+def fst : Z2 -> Z :=
+  fun (p : Z2) =>
+    Z2_rec (fun (q : Z2) => Z) (fun (x : Z) (y : Z) => x) p
+
+def snd : Z2 -> Z :=
+  fun (p : Z2) =>
+    Z2_rec (fun (q : Z2) => Z) (fun (x : Z) (y : Z) => y) p
+
+theorem f_one_to_one :
+  (sub : Z -> Z -> Z)
+  (add1 : Z -> Z)
+  (mul3 : Z -> Z)
+  (h : Z -> Z)
+  (EqZ : Z -> Z -> Type)
+  (EqZ2 : Z2 -> Z2 -> Type)
+  (subst : (P : Z -> Type) -> (a b : Z) -> EqZ a b -> P a -> P b)
+  (eq_fst : (p q : Z2) -> EqZ2 p q -> EqZ (fst p) (fst q))
+  (eq_snd : (p q : Z2) -> EqZ2 p q -> EqZ (snd p) (snd q))
+  (eq_mk : (x1 y1 x2 y2 : Z) -> EqZ x1 x2 -> EqZ y1 y2 -> EqZ2 (mk x1 y1) (mk x2 y2))
+  (add1_cancel : (a b : Z) -> EqZ (add1 a) (add1 b) -> EqZ a b)
+  (mul3_cancel : (a b : Z) -> EqZ (mul3 a) (mul3 b) -> EqZ a b)
+  (sub_left_cancel : (c a b : Z) -> EqZ (sub c a) (sub c b) -> EqZ a b)
+  (h_inj : (a b : Z) -> EqZ (h a) (h b) -> EqZ a b)
+  (x1 y1 x2 y2 : Z)
+  (hf : EqZ2 (mk (sub (h x1) y1) (add1 (mul3 (h x1)))) (mk (sub (h x2) y2) (add1 (mul3 (h x2)))))
+  -> EqZ2 (mk x1 y1) (mk x2 y2)
+:=
+  fun
+    (sub : Z -> Z -> Z)
+    (add1 : Z -> Z)
+    (mul3 : Z -> Z)
+    (h : Z -> Z)
+    (EqZ : Z -> Z -> Type)
+    (EqZ2 : Z2 -> Z2 -> Type)
+    (subst : (P : Z -> Type) -> (a b : Z) -> EqZ a b -> P a -> P b)
+    (eq_fst : (p q : Z2) -> EqZ2 p q -> EqZ (fst p) (fst q))
+    (eq_snd : (p q : Z2) -> EqZ2 p q -> EqZ (snd p) (snd q))
+    (eq_mk : (x1 y1 x2 y2 : Z) -> EqZ x1 x2 -> EqZ y1 y2 -> EqZ2 (mk x1 y1) (mk x2 y2))
+    (add1_cancel : (a b : Z) -> EqZ (add1 a) (add1 b) -> EqZ a b)
+    (mul3_cancel : (a b : Z) -> EqZ (mul3 a) (mul3 b) -> EqZ a b)
+    (sub_left_cancel : (c a b : Z) -> EqZ (sub c a) (sub c b) -> EqZ a b)
+    (h_inj : (a b : Z) -> EqZ (h a) (h b) -> EqZ a b)
+    (x1 y1 x2 y2 : Z)
+    (hf : EqZ2 (mk (sub (h x1) y1) (add1 (mul3 (h x1)))) (mk (sub (h x2) y2) (add1 (mul3 (h x2)))))
+  =>
+    eq_mk x1 y1 x2 y2
+      (h_inj x1 x2
+        (mul3_cancel (h x1) (h x2)
+          (add1_cancel (mul3 (h x1)) (mul3 (h x2))
+            (eq_snd
+              (mk (sub (h x1) y1) (add1 (mul3 (h x1))))
+              (mk (sub (h x2) y2) (add1 (mul3 (h x2))))
+              hf))))
+      (sub_left_cancel (h x2) y1 y2
+        (subst
+          (fun (z : Z) => EqZ (sub z y1) (sub (h x2) y2))
+          (h x1)
+          (h x2)
+          (mul3_cancel (h x1) (h x2)
+            (add1_cancel (mul3 (h x1)) (mul3 (h x2))
+              (eq_snd
+                (mk (sub (h x1) y1) (add1 (mul3 (h x1))))
+                (mk (sub (h x2) y2) (add1 (mul3 (h x2))))
+                hf)))
+          (eq_fst
+            (mk (sub (h x1) y1) (add1 (mul3 (h x1))))
+            (mk (sub (h x2) y2) (add1 (mul3 (h x2))))
+            hf)))

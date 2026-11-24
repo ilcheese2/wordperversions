@@ -48,12 +48,16 @@ impl ConstantInfo {
     }
 }
 
+fn comment<'a>() -> impl Parser<'a, &'a str, (), extra::Err<Simple<'a, char>>> + Clone {
+    just("--").then(any().and_is(just("\n").not()).repeated()).padded().repeated().padded().ignored()
+}
+
 fn sym(s: &'_ str) -> impl Parser<'_, &'_ str, &'_ str, extra::Err<Simple<'_, char>>> + Clone {
-    just(s).padded()
+    just(s).padded_by(comment())
 }
 
 fn kwd(s: &'_ str) -> impl Parser<'_, &'_ str, &'_ str, extra::Err<Simple<'_, char>>> + Clone {
-    keyword(s).padded()
+    keyword(s).padded_by(comment())
 }
 
 fn ident<'a>() -> impl Parser<'a, &'a str, String, extra::Err<Simple<'a, char>>> + Clone {
@@ -61,7 +65,7 @@ fn ident<'a>() -> impl Parser<'a, &'a str, String, extra::Err<Simple<'a, char>>>
         .filter(|x| {
             *x != "def" && *x != "fun" && *x != "theorem" && *x != "Type" && *x != "inductive"
         })
-        .padded()
+        .padded_by(comment())
         .map(|s: &str| s.to_string())
 }
 
@@ -201,6 +205,7 @@ fn parser<'src>()
     ))
     .repeated()
     .collect()
+    .padded_by(comment())
     .then_ignore(end())
 }
 
@@ -452,7 +457,7 @@ fn infer(env: &Environment, context: &mut Vec<Term>, term: &Term) -> Result<Term
             context.push(*ty.clone());
             let body = infer(env, context, body)?;
             context.pop();
-            Ok(lambda(name.clone(), *ty.clone(), body))
+            Ok(pi(name.clone(), *ty.clone(), body))
         }
         _ => Err(TypeError::Unsupported),
     }
@@ -593,7 +598,7 @@ fn gen_recursor(ind: &str, branches: &Vec<(String, Term)>) -> ConstantInfo {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut s = String::new();
-    File::open("variable.pv")?.read_to_string(&mut s)?;
+    File::open("173.pv")?.read_to_string(&mut s)?;
     s = s.replace("→", "->");
     let parser = parser();
     let declarations = parser.parse(s.as_str()).into_result().unwrap(); // fuck you
@@ -603,5 +608,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, declaration) in declarations {
         add_declaration(&mut env, name, declaration)?;
     }
+    println!("probably verified");
     Ok(())
 }
